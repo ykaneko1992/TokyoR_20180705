@@ -1,189 +1,182 @@
 library(tidyverse)
 library(glmnet)
-library(randomForest)
-library(grf)
 library(hdm)
-library(hdm)	
-library(randomForest)	
-library(xtable)	
 library(plm)
 
 set.seed(2018)
 
-#Read dataset
-df_a <- read.csv("Downloads/criteo-uplift.csv")
-df_treat <- df_a %>%
-  filter(treatment == 1) 
-df_treat_sampled <- sample_frac(df_treat, 0.002)
 
+# download (about 450 MB)
+# https://s3.us-east-2.amazonaws.com/criteo-uplift-dataset/
+download.file("https://s3.us-east-2.amazonaws.com/criteo-uplift-dataset/criteo-uplift.csv.gz", "criteo-uplift.csv.gz")
+# Read dataset
+df_a <- read.csv(gzfile("criteo-uplift.csv.gz"))
 
-df_control <- df_a %>%
-  filter(treatment == 0) 
-df_control_sampled <- sample_frac(df_control, 0.017)
+# stratified sampling by treatment
+df_sampled <- bind_rows(
+  filter(df_a, treatment==1) %>% sample_frac(.002),
+  filter(df_a, treatment==0) %>% sample_frac(.017)
+) %>% select(-conversion, -exposure) %>%
+  rename(W=treatment, Y=visit)
 
+summary(df_a)
+summary(df_sampled)
 
-df <- rbind(df_treat_sampled, df_control_sampled)
-df_check <- head(df)
-rm(df_treat,df_treat_sampled,df_control,df_control_sampled)
-
-summary(df)
-summary(df_mod)
-#make Dataset
-df <- df %>%
-  select(-conversion, -exposure)
-
-df <- df %>%
-  plyr::rename(c(treatment = "W",
-                 visit= "Y"))
-#Naive ATE
-naive_ate <- function(dataset, W_var, outcome_var, method = "naive"){
-  mean_df <- dataset %>%
-    group_by_(W_var) %>%
-    summarise_(y = paste("mean(", outcome_var, ")"),
-               y_var = paste("var(", outcome_var, ")"),
-               count = "n()") %>%
-    mutate(y_var_weight = y_var/(count - 1))
-  
-  E_y0 = mean_df$y[mean_df$W == 0]
-  E_y1 = mean_df$y[mean_df$W == 1]
-  
-  tau_hat <- E_y1 - E_y0
-  se_hat <- sum(mean_df$y_var_weight) %>% sqrt()
-  
-  upper_ci <- tau_hat + se_hat*1.96
-  lower_ci <- tau_hat - se_hat*1.96
-  
-  return(data.frame(Method = method, ATE = tau_hat, lower_ci = lower_ci, upper_ci = upper_ci))
+# Naive ATE
+naive_ate <- function(formula=Y~W, data, method="naive"){
+  outcome <- as.list(formula)[[2]] %>% as.character
+  treatment <- attr(terms(formula), "term.labels")[1]
+  print(outcome)
+  print(treatment)
+  # group mean and variance
+  mean <- data.frame(y=data[, outcome],
+                     w=data[, treatment]) %>%
+    group_by(w) %>%
+    summarise(avg=mean(y),
+              var=var(y),
+              num=n()) %>%
+    mutate(var_weight = var/(num - 1))
+  # calculate ATE and C.I.
+  tau_hat <- mean$avg[mean$w==1] - mean$avg[mean$w==0]
+  se_hat <- sum(mean$var_weight) %>% sqrt
+  return(data.frame(
+    Method = method,
+    ATE = tau_hat,
+    lower_ci = tau_hat - se_hat * 1.96,
+    upper_ci = tau_hat + se_hat * 1.96,
+    stringsAsFactors = F
+  ))
 }
-result_df <- data.frame()
-ate1 <- naive_ate(df , "W", "Y", method = "naive")
-result_df <- result_df %>% rbind(ate1)
-#Introduce Sampling bias
+
+df_result <- data.frame()
+df_result <- bind_rows(df_result, naive_ate(Y~W, df_sampled, method = "naive"))
+
+# Introduce Sampling bias
 pt <- .80 # Drop p% of users who satisfy the following condition
 pc <- .95
-
-drop_from_treat <-  (df[,"f6"] < 2 | df[,"f0"] > 0.5) 
-
-drop_from_control <-(df[,"f6"] > 2 | df[,"f0"] < 0.5)
-
-drop_treat_idx <- which(df[,"W"] == 1 & drop_from_treat)
-drop_control_idx <- which(df[,"W"] == 0 & drop_from_control)
-
-drop_idx <- unique(c(drop_treat_idx[1:round(pt*length(drop_treat_idx))],
-                     drop_control_idx[1:round(pc*length(drop_control_idx))]))
-
+drop_idx <- c(which((df_sampled[,"f6"] < 2 | df_sampled[,"f0"] > 0.5) & df_sampled[,"W"] == 1)[1:round(pt*length(drop_treat_idx))],
+              which((df_sampled[,"f6"] > 2 | df_sampled[,"f0"] < 0.5) & df_sampled[,"W"] == 0)[1:round(pc*length(drop_control_idx))]
+              )
 print(length(drop_idx))
-df_mod <- df[-drop_idx,]
+df_mod <- df_sampled[-drop_idx, ]
 df_mod <- df_mod[sample(nrow(df_mod)),]
 rownames(df_mod) <- NULL
 
+# naive_ate with sampling bias
+df_result <- bind_rows(df_result, naive_ate(Y~W, df_mod , method = "naive_biased"))
 
-#naive_ate with sampling bias
-ate2 <- naive_ate(df_mod , "W", "Y", method = "naive_biased")
-result_df <- result_df %>% rbind(ate2)
 
-#ggplot
-ggplot(result_df, aes(y = ATE, x = Method, color = Method)) + 
-  geom_pointrange(aes(ymax = upper_ci, ymin = lower_ci)) + 
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-#SIngle-eq Lasso
-ate_condmean_lasso <- function(dataset, treatment_var, outcome_var) {
-  # Covariate names
-  regs <- c(covariates, treatment_var)
+# Single-eq Lasso
+ate_condmean_lasso <- function(formula=Y~0+., data, treatment_var="W") {
   
   # glmnet requires inputs as matrices
-  x <- as.matrix(dataset[regs])  
-  y <- as.matrix(dataset[,outcome_var])
+  X <- model.matrix(formula, data)
+  y <- model.response(model.frame(formula, data))
   
   # Set the penalty to betaw to be zero
-  pfac <- c(rep(1,length(covariates)), 0) 
+  pfac <- rep(1, NCOL(X)) 
+  names(pfac) <- colnames(X)
+  pfac[treatment_var] = 0
   
   # Call glmnet with alpha=1 is LASSO penalty
-  model <- cv.glmnet(x, y, 
+  model <- cv.glmnet(X, y, 
                      alpha=1, # 
                      penalty.factor=pfac) 
   
   # Automatically performs CV!
-  betaw <- coef(model)[treatment_var,]
-  return(data.frame(Method = "Single-equation LASSO", ATE = betaw, lower_ci = betaw, upper_ci = betaw))
+  betaw <- coef(model)[treatment_var, ]
+  return(data.frame(Method = "Single-equation LASSO",
+                    ATE = betaw,
+                    lower_ci = NA,
+                    upper_ci = NA,
+                    stringsAsFactors = F))
 }
 
-tauhat_lasso_seq <- ate_condmean_lasso(df_mod, treatment_var = "W", outcome_var = "Y")
+# append the result
+df_result <- bind_rows(
+  df_result,
+  ate_condmean_lasso(Y~0+., df_mod, treatment_var = "W"))
 
-result_df <- result_df %>% rbind(tauhat_lasso_seq)
 
-
-#Usual Lasso
-ate_lasso <- function(dataset, treatment_var, outcome_var) {
-  # Covariate names
-  regs <- c(covariates, treatment_var)
-  
+# Usual Lasso
+ate_lasso <- function(formula=Y~0+., data, treatment_var="W") {
   # glmnet requires inputs as matrices
-  x <- as.matrix(dataset[regs])  
-  y <- as.matrix(dataset[,outcome_var])
-  
-  # Set the penalty to betaw to be zero
-  pfac <- c(rep(1,length(covariates)), 1) 
+  X <- model.matrix(formula, data)
+  y <- model.response(model.frame(formula, data))
   
   # Call glmnet with alpha=1 is LASSO penalty
-  model <- cv.glmnet(x, y, 
-                     alpha=1, # 
-                     penalty.factor=pfac) 
+  model <- cv.glmnet(X, y, alpha=1) 
   
   # Automatically performs CV!
   betaw <- coef(model)[treatment_var,]
-  return(data.frame(Method = "Usual LASSO", ATE = betaw, lower_ci = betaw, upper_ci = betaw))
+  return(data.frame(Method = "Usual LASSO",
+                    ATE = betaw,
+                    lower_ci = NA,
+                    upper_ci = NA,
+                    stringsAsFactors = F))
 }
 
-tauhat_lasso_all <- ate_lasso(df_mod, treatment_var = "W", outcome_var = "Y")
 
-result_df <- result_df %>% rbind(tauhat_lasso_all)
+# append the result
+df_result <- bind_rows(df_result, ate_lasso(Y~0+., df_mod))
 
+# comparison
+ggplot(df_result, aes(x = factor(Method, level=Method), y = ATE, color = Method)) + 
+  geom_point() +
+  geom_errorbar(aes(ymax = upper_ci, ymin = lower_ci), width = .1) + 
+  theme(axis.text.x = element_text(angle = -45, hjust = 0))
 
 # Double ML Lasso
-
-DML2.for.PLM <- function(x, d, y, dreg, yreg, nfold=5) {	
+DML2.for.PLM <- function(y, D, Z, reg_D=hdm::rlasso, reg_Y=hdm::rlasso, n_folds = 5,
+                         reg_D_args = NULL, reg_Y_args = NULL) {
   # this implements DML2 algorithm, where there moments are estimated via DML, before constructing	
-  # the pooled estimate of theta randomly split data into folds	
-  nobs <- nrow(x)	
-  foldid <- rep.int(1:nfold,times = ceiling(nobs/nfold))[sample.int(nobs)]	
-  I <- split(1:nobs, foldid)	
-  # create residualized objects to fill	
-  ytil <- dtil <- rep(NA, nobs)	
-  # obtain cross-fitted residuals	
-  cat("fold: ")	
-  for(b in 1:length(I)){	
-    dfit <- dreg(x[-I[[b]],], d[-I[[b]]])  #take a fold out	
-    yfit <- yreg(x[-I[[b]],], y[-I[[b]]])  # take a folot out	
-    dhat <- predict(dfit, x[I[[b]],], type="response")  #predict the fold out	
-    yhat <- predict(yfit, x[I[[b]],], type="response")  #predict the fold out	
-    dtil[I[[b]]] <- (d[I[[b]]] - dhat) #record residual	
-    ytil[I[[b]]] <- (y[I[[b]]] - yhat) #record residial	
-    cat(b," ")	
-  }	
-  rfit <- lm(ytil ~ dtil)               #estimate the main parameter by regressing one residual on the other	
-  coef.est <- coef(rfit)[2]             #extract coefficient 	
-  se <- sqrt(vcovHC(rfit)[2,2])         #record standard error	
-  cat(sprintf("\ncoef (se) = %g (%g)\n", coef.est , se))	
-  low_ <- coef.est - se*1.96
-  upp_ <- coef.est + se*1.96
-  return(data.frame(Method = "Double ML", ATE = coef.est, lower_ci = low_, upper_ci = upp_))
-}	
+  # the pooled estimate of theta randomly split data into folds
+  n_obs <- NROW(y)
+  foldid <- rep.int(1:n_folds, times = ceiling(n_obs/n_folds))[sample.int(n_obs)]
+  index_fold <- split(1:n_obs, foldid)
+  # initialize y, d
+  ytil <- dtil <- rep(NA, n_obs)
+  b <- 1  # iteration indicator
+  cat("fold: ")
+  for(fold in index_fold){
+    # fit
+    dfit <- do.call(reg_D, append(list(x=as.matrix(Z)[-fold, ],
+                                       y=as.matrix(D)[-fold, ]),
+                                  reg_D_args)
+    )
+    yfit <- do.call(reg_Y, append(list(x=as.matrix(Z)[-fold, ],
+                                       y=as.matrix(y)[-fold, ]),
+                                  reg_Y_args)
+    )
+    # take residuals
+    dtil[fold] <- (as.numeric(D)[fold] - predict(dfit, as.matrix(Z)[fold, ], type="response"))
+    ytil[fold] <- (as.numeric(y)[fold] - predict(yfit, as.matrix(Z)[fold, ], type="response"))
+    cat(b," ")
+    b <- b + 1
+  }
+  rfit <- lm(ytil ~ dtil) #estimate the main parameter by regressing one residual on the other
+  coef.est <- coef(rfit)["dtil"] #extract coefficient
+  se <- sqrt(vcovHC(rfit)["dtil", "dtil"])  # record standard error
+  cat(sprintf("\ncoef (se) = %g (%g)\n", coef.est , se))
+  return(data.frame(Method = "Double ML",
+                    ATE = coef.est,
+                    lower_ci = coef.est - se * 1.96,
+                    upper_ci = coef.est + se * 1.96,
+                    stringsAsFactors = F))
+}
 
-y= as.matrix(df_mod[,14])          #outcome: growth rate	
-d= as.matrix(df_mod[,13])          #treatment: initial wealth		
-x= as.matrix(df_mod[,-c(13,14)])  #controls: country characteristics	
-dreg <- function(x,d){ rlasso(x, d) }  #ML method= rlasso	
-yreg <- function(x,y){ rlasso(x, y) }  #ML method = rlasso	
-DML2.lasso = DML2.for.PLM(x, d, y, dreg, yreg, nfold=5)	
-
-result_df <- result_df %>% rbind(DML2.lasso)
-#ggplot
-ggplot(result_df, aes(y = ATE, x = Method, color = Method)) + 
-  geom_pointrange(aes(ymax = upper_ci, ymin = lower_ci)) + 
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
+df_result <- bind_rows(
+  df_result,
+  DML2.for.PLM(y=df_mod$Y,
+               D = df_mod$W,
+               Z = dplyr::select(df_mod, starts_with("f")),
+               reg_D = rlasso, reg_Y = rlasso)
+)
+# comparison
+ggplot(df_result, aes(x = factor(Method, level=Method), y = ATE, color = Method)) + 
+  geom_point() +
+  geom_errorbar(aes(ymax = upper_ci, ymin = lower_ci), width = .1) + 
+  theme(axis.text.x = element_text(angle = -45, hjust = 0))
 
 
 # Propensity Lasso
@@ -202,16 +195,20 @@ prop_score_lasso <- function(dataset, treatment_var) {
   return(p)
 }
 
+covariates <- dplyr::select(df_mod, starts_with("f")) %>% colnames
 p_lasso <- prop_score_lasso(df_mod, treatment_var = "W")
+
+# TODO: ??????????
 tauhat_ps_lasso <- prop_score_weight(dataset = df_mod, 
                                      p = p_lasso[,1], 
                                      treatment_var = "W", 
                                      outcome_var = "Y",
                                      method = "Propensity_Weighting_LASSOPS")
 
-result_df <- result_df %>% rbind(tauhat_ps_lasso)
+df_result <- df_result %>% bind_rows(tauhat_ps_lasso)
 
 #ggplot
-ggplot(result_df, aes(y = ATE, x = Method, color = Method)) + 
-  geom_pointrange(aes(ymax = upper_ci, ymin = lower_ci)) + 
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggplot(df_result, aes(x = factor(Method, level=Method), y = ATE, color = Method)) + 
+  geom_point() +
+  geom_errorbar(aes(ymax = upper_ci, ymin = lower_ci), width = .1) + 
+  theme(axis.text.x = element_text(angle = -45, hjust = 0))
